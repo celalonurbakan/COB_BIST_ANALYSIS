@@ -3,7 +3,7 @@ name: BIST Günlük Tarama
 on:
   schedule:
     # Her sabah 06:00 UTC = 09:00 İstanbul (Pazartesi-Cuma)
-    - cron: '0 6 * * 1-5'
+    - cron: '56 6 * * 1-5'
   workflow_dispatch:  # Manuel tetikleme (test için)
 
 jobs:
