@@ -100,7 +100,7 @@ def yahoo_tarama():
         # Hacim anomalisi: günlük hacim ortalamanın 2x+ üzerinde
         if ort_hacim and ort_hacim > 0:
             carpan = hacim / ort_hacim
-            if carpan >= 1.8:
+            if carpan >= 1.5:
                 # Fiyat değişimi hesapla
                 kapanis = veri.get("_kapanis_listesi", [])
                 degisim = 0
@@ -116,8 +116,8 @@ def yahoo_tarama():
                         "kaynak": "Yahoo Finance",
                     })
 
-        # Düşük değerleme: PD/DD < 1
-        if pb and 0 < pb < 1.2:
+        # Düşük değerleme: PD/DD < 2.0 (daha geniş eşik)
+        if pb and 0 < pb < 2.0:
             dusuk_deger.append({
                 "sembol": bist,
                 "fiyat": round(fiyat, 2),
@@ -140,55 +140,53 @@ def yahoo_tarama():
 # KAYNAK 2: KAP RSS
 # ─────────────────────────────────────────────
 
-KAP_RSS_URLS = [
-    "https://www.kap.org.tr/rss/ozel-durum",
-    "https://www.kap.org.tr/tr/rss/ozel-durum",
-    "https://www.kap.org.tr/rss/bildirim",
-]
-
 ANAHTAR = [
     "sözleşme", "ihale", "ihracat", "sipariş", "ortaklık",
     "kapasite", "yatırım", "proje", "anlaşma", "kazandı",
     "contract", "agreement", "award", "investment",
 ]
 
-def kap_rss_tara():
+def kap_bigpara_tara():
+    """Bigpara üzerinden KAP haberlerini çeker (KAP RSS kapalı)."""
     bulunanlar = []
-    for url in KAP_RSS_URLS:
+    urls = [
+        "https://bigpara.hurriyet.com.tr/haberler/kap-haberleri/",
+        "https://bigpara.hurriyet.com.tr/haberler/ozel-durum-aciklamalari/",
+    ]
+    from bs4 import BeautifulSoup
+    for url in urls:
         try:
             r = SESSION.get(url, timeout=15)
-            print(f"     KAP {url}: {r.status_code} ({len(r.text)} byte)")
+            print(f"     Bigpara {url}: {r.status_code} ({len(r.text)} byte)")
             if r.status_code != 200:
                 continue
-            root = ET.fromstring(r.content)
-            for item in root.iter("item"):
-                baslik_orijinal = item.findtext("title", "")
-                baslik = baslik_orijinal.lower()
-                aciklama = item.findtext("description", "").lower()
-                metin = baslik + " " + aciklama
+            soup = BeautifulSoup(r.text, "html.parser")
+            haberler = soup.find_all(["h2","h3","a"], limit=60)
+            for tag in haberler:
+                metin = tag.get_text(strip=True).lower()
                 for kelime in ANAHTAR:
                     if kelime in metin:
-                        parcalar = baslik_orijinal.split()
-                        sembol = parcalar[0].upper() if parcalar else "—"
+                        # Sembol bulmaya çalış (büyük harf kelime)
+                        import re
+                        semboller = re.findall(r'\b[A-Z]{3,6}\b', tag.get_text(strip=True))
+                        sembol = semboller[0] if semboller else "KAP"
                         bulunanlar.append({
                             "sembol": sembol,
-                            "baslik": baslik_orijinal[:100],
-                            "tarih": item.findtext("pubDate", "")[:16],
-                            "kaynak": "KAP RSS",
+                            "baslik": tag.get_text(strip=True)[:100],
+                            "tarih": datetime.now().strftime("%d.%m.%Y"),
+                            "kaynak": "Bigpara/KAP",
                             "tip": f"'{kelime}'",
                         })
                         break
-            if bulunanlar:
-                break  # Çalışan URL bulundu
         except Exception as e:
-            print(f"     KAP RSS {url} hata: {e}")
+            print(f"     Bigpara hata: {e}")
 
-    # Tekrarları temizle
     gorulen, temiz = set(), []
     for item in bulunanlar:
-        if item["sembol"] not in gorulen:
+        if item["sembol"] not in gorulen and item["sembol"] != "KAP":
             gorulen.add(item["sembol"])
             temiz.append(item)
+    print(f"     {len(temiz)} KAP haberi bulundu")
     return temiz[:10]
 
 
@@ -207,9 +205,10 @@ def guclu_sinyaller(kap, hacim, deger):
                 tum[s] = {"sembol": s, "sinyaller": [], "puan": 0}
             tum[s]["sinyaller"].append(f"✅ {item['kaynak']}: {item['tip']}")
             tum[s]["puan"] += 1
-    sonuc = [v for v in tum.values() if v["puan"] >= 2]
+    # Puan 1 bile olsa listeye al (tek kaynak yeterli)
+    sonuc = [v for v in tum.values() if v["puan"] >= 1]
     sonuc.sort(key=lambda x: x["puan"], reverse=True)
-    return sonuc
+    return sonuc[:10]
 
 
 # ─────────────────────────────────────────────
@@ -356,9 +355,9 @@ def mail_gonder(html):
 def main():
     print(f"🔍 BIST Tarama v3 — {datetime.now().strftime('%d.%m.%Y %H:%M')}")
 
-    print("  → KAP RSS...")
-    kap = kap_rss_tara()
-    print(f"     {len(kap)} açıklama bulundu")
+    print("  → KAP/Bigpara haberleri...")
+    kap = kap_bigpara_tara()
+    print(f"     {len(kap)} haber bulundu")
 
     print("  → Yahoo Finance tarama...")
     hacim, deger = yahoo_tarama()
