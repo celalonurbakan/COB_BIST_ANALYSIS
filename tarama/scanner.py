@@ -1,17 +1,13 @@
 """
-BIST Multibagger Tarama Sistemi v2
-Güvenilir API kaynaklarını kullanır:
-- Yahoo Finance API (hisse fiyat/hacim verileri)
-- KAP RSS Feed (özel durum açıklamaları)
-- IsYatirim JSON API (takas verileri)
+BIST Multibagger Tarama Sistemi v3
+- Yahoo Finance v7 API (BIST hisseleri için çalışan endpoint)
+- KAP RSS (doğru URL ile)
+- Detaylı hata loglama
 """
 
-import os
-import smtplib
-import requests
-import json
+import os, smtplib, requests, json, time
 import xml.etree.ElementTree as ET
-from datetime import datetime, timedelta
+from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -19,244 +15,191 @@ HEDEF_MAIL = os.environ.get("HEDEF_MAIL", "")
 GMAIL_USER = os.environ.get("GMAIL_USER", "")
 GMAIL_PASS = os.environ.get("GMAIL_PASS", "")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/html, */*",
-    "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
-}
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/html, */*;q=0.9",
+    "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+})
 
 # ─────────────────────────────────────────────
-# KAYNAK 1: KAP RSS — Özel Durum Açıklamaları
+# KAYNAK 1: Yahoo Finance v7 — Hisse Verileri
 # ─────────────────────────────────────────────
+
+BIST_HISSELER = [
+    # Küçük/orta ölçekli spekülatif potansiyelli
+    "SDTTR.IS", "ALTNY.IS", "KLYPV.IS", "ALVES.IS", "BINHO.IS",
+    "AKFYE.IS", "IZENR.IS", "GWIND.IS", "CWENE.IS", "KAPLM.IS",
+    "KTMRK.IS", "PAPIL.IS", "TCKRC.IS",
+    # Orta büyüklük
+    "ASELS.IS", "THYAO.IS", "EREGL.IS", "TCELL.IS", "EKGYO.IS",
+    "MGROS.IS", "ULKER.IS", "SOKM.IS", "AEFES.IS", "SAHOL.IS",
+    "TOASO.IS", "FROTO.IS", "PETKM.IS", "KOZAL.IS", "SISE.IS",
+]
+
+def yahoo_hisse_verisi(sembol):
+    """Tek bir hisse için Yahoo Finance v7 API'den veri çeker."""
+    try:
+        # Önce v7 dene
+        url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={sembol}"
+        r = SESSION.get(url, timeout=12)
+        if r.status_code == 200:
+            data = r.json()
+            sonuc = data.get("quoteResponse", {}).get("result", [])
+            if sonuc:
+                return sonuc[0]
+
+        # v7 olmadıysa v8 chart dene
+        url2 = f"https://query2.finance.yahoo.com/v8/finance/chart/{sembol}?interval=1d&range=30d"
+        r2 = SESSION.get(url2, timeout=12)
+        if r2.status_code == 200:
+            data2 = r2.json()
+            meta = data2.get("chart", {}).get("result", [{}])[0].get("meta", {})
+            inds = data2.get("chart", {}).get("result", [{}])[0].get("indicators", {}).get("quote", [{}])[0]
+            hacimler = [h for h in inds.get("volume", []) if h]
+            kapanis = [k for k in inds.get("close", []) if k]
+            if meta and hacimler:
+                return {
+                    "symbol": sembol,
+                    "regularMarketPrice": meta.get("regularMarketPrice", 0),
+                    "regularMarketVolume": hacimler[-1] if hacimler else 0,
+                    "averageDailyVolume3Month": sum(hacimler[-20:]) / len(hacimler[-20:]) if len(hacimler) >= 5 else 0,
+                    "priceToBook": meta.get("priceToBook"),
+                    "trailingPE": meta.get("trailingPE"),
+                    "_kapanis_listesi": kapanis,
+                    "_hacim_listesi": hacimler,
+                }
+    except Exception as e:
+        print(f"    Yahoo {sembol} hata: {e}")
+    return None
+
+
+def yahoo_tarama():
+    """Tüm hisseleri tarar, hacim anomalisi ve düşük değerleme tespit eder."""
+    hacim_anomali = []
+    dusuk_deger = []
+    basarili = 0
+
+    print(f"  → {len(BIST_HISSELER)} hisse taranıyor...")
+
+    for i, sembol in enumerate(BIST_HISSELER):
+        veri = yahoo_hisse_verisi(sembol)
+        if not veri:
+            continue
+        basarili += 1
+
+        bist = sembol.replace(".IS", "")
+        fiyat = veri.get("regularMarketPrice", 0) or 0
+        hacim = veri.get("regularMarketVolume", 0) or 0
+        ort_hacim = veri.get("averageDailyVolume3Month", 0) or 0
+        pb = veri.get("priceToBook")
+        pe = veri.get("trailingPE")
+
+        # Hacim anomalisi: günlük hacim ortalamanın 2x+ üzerinde
+        if ort_hacim and ort_hacim > 0:
+            carpan = hacim / ort_hacim
+            if carpan >= 1.8:
+                # Fiyat değişimi hesapla
+                kapanis = veri.get("_kapanis_listesi", [])
+                degisim = 0
+                if len(kapanis) >= 6:
+                    degisim = (kapanis[-1] - kapanis[-6]) / kapanis[-6] * 100 if kapanis[-6] else 0
+
+                if -8 <= degisim <= 20:  # Fiyat sakin = sessiz toplama
+                    hacim_anomali.append({
+                        "sembol": bist,
+                        "fiyat": round(fiyat, 2),
+                        "tip": f"Hacim {round(carpan,1)}x | Fiyat {'+' if degisim>=0 else ''}{round(degisim,1)}%",
+                        "carpan": round(carpan, 1),
+                        "kaynak": "Yahoo Finance",
+                    })
+
+        # Düşük değerleme: PD/DD < 1
+        if pb and 0 < pb < 1.2:
+            dusuk_deger.append({
+                "sembol": bist,
+                "fiyat": round(fiyat, 2),
+                "tip": f"PD/DD: {round(pb,2)} | F/K: {round(pe,1) if pe else '—'}",
+                "pd_dd": round(pb, 2),
+                "kaynak": "Yahoo Finance",
+            })
+
+        # Rate limit için küçük bekleme
+        if i % 5 == 4:
+            time.sleep(0.5)
+
+    print(f"     {basarili} hisse başarıyla çekildi")
+    hacim_anomali.sort(key=lambda x: x["carpan"], reverse=True)
+    dusuk_deger.sort(key=lambda x: x["pd_dd"])
+    return hacim_anomali[:8], dusuk_deger[:6]
+
+
+# ─────────────────────────────────────────────
+# KAYNAK 2: KAP RSS
+# ─────────────────────────────────────────────
+
+KAP_RSS_URLS = [
+    "https://www.kap.org.tr/rss/ozel-durum",
+    "https://www.kap.org.tr/tr/rss/ozel-durum",
+    "https://www.kap.org.tr/rss/bildirim",
+]
+
+ANAHTAR = [
+    "sözleşme", "ihale", "ihracat", "sipariş", "ortaklık",
+    "kapasite", "yatırım", "proje", "anlaşma", "kazandı",
+    "contract", "agreement", "award", "investment",
+]
+
 def kap_rss_tara():
-    """KAP RSS feed üzerinden bugünkü önemli açıklamaları çeker."""
     bulunanlar = []
-    anahtar_kelimeler = [
-        "sözleşme", "ihale", "ihracat", "sipariş", "ortaklık",
-        "kapasite", "yatırım", "proje", "anlaşma", "kazandı",
-        "contract", "agreement", "export", "investment"
-    ]
-
-    rss_urls = [
-        "https://www.kap.org.tr/tr/rss/ozel-durum",
-        "https://www.kap.org.tr/tr/rss/finansal-rapor",
-    ]
-
-    for url in rss_urls:
+    for url in KAP_RSS_URLS:
         try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
+            r = SESSION.get(url, timeout=15)
+            print(f"     KAP {url}: {r.status_code} ({len(r.text)} byte)")
             if r.status_code != 200:
                 continue
-
             root = ET.fromstring(r.content)
-            bugun = datetime.now().strftime("%Y-%m-%d")
-
             for item in root.iter("item"):
-                baslik = item.findtext("title", "").lower()
+                baslik_orijinal = item.findtext("title", "")
+                baslik = baslik_orijinal.lower()
                 aciklama = item.findtext("description", "").lower()
-                tarih = item.findtext("pubDate", "")
-                link = item.findtext("link", "")
-
                 metin = baslik + " " + aciklama
-
-                for kelime in anahtar_kelimeler:
+                for kelime in ANAHTAR:
                     if kelime in metin:
-                        # Sembolü başlıktan çıkar
-                        sembol = ""
-                        baslik_orijinal = item.findtext("title", "")
                         parcalar = baslik_orijinal.split()
-                        if parcalar:
-                            sembol = parcalar[0].upper()
-
+                        sembol = parcalar[0].upper() if parcalar else "—"
                         bulunanlar.append({
                             "sembol": sembol,
-                            "baslik": baslik_orijinal[:120],
-                            "tarih": tarih[:25] if tarih else "",
-                            "link": link,
+                            "baslik": baslik_orijinal[:100],
+                            "tarih": item.findtext("pubDate", "")[:16],
                             "kaynak": "KAP RSS",
-                            "tip": f"'{kelime}' içeriyor"
+                            "tip": f"'{kelime}'",
                         })
                         break
-
+            if bulunanlar:
+                break  # Çalışan URL bulundu
         except Exception as e:
-            print(f"KAP RSS hatası ({url}): {e}")
+            print(f"     KAP RSS {url} hata: {e}")
 
-    # Tekrar eden sembolleri temizle
-    gorulen = set()
-    temiz = []
+    # Tekrarları temizle
+    gorulen, temiz = set(), []
     for item in bulunanlar:
         if item["sembol"] not in gorulen:
             gorulen.add(item["sembol"])
             temiz.append(item)
-
-    return temiz[:12]
-
-
-# ─────────────────────────────────────────────
-# KAYNAK 2: İş Yatırım — Yabancı Takas Raporu
-# ─────────────────────────────────────────────
-def isyatirim_takas_tara():
-    """İş Yatırım'ın günlük yabancı takas raporunu çeker."""
-    bulunanlar = []
-
-    try:
-        # İş Yatırım günlük yabancı işlem raporu
-        url = "https://www.isyatirim.com.tr/analizler/hisse/yabanci-islemler"
-        r = requests.get(url, headers=HEADERS, timeout=15)
-
-        if r.status_code == 200:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(r.text, "html.parser")
-
-            # Tablo satırlarını ara
-            tablolar = soup.find_all("table")
-            for tablo in tablolar[:3]:
-                satirlar = tablo.find_all("tr")[1:11]
-                for satir in satirlar:
-                    kolonlar = satir.find_all("td")
-                    if len(kolonlar) >= 2:
-                        sembol = kolonlar[0].get_text(strip=True)
-                        deger = kolonlar[1].get_text(strip=True) if len(kolonlar) > 1 else ""
-
-                        if sembol and len(sembol) <= 8 and sembol.isupper():
-                            bulunanlar.append({
-                                "sembol": sembol,
-                                "deger": deger,
-                                "kaynak": "İş Yatırım",
-                                "tip": "Yabancı net alım"
-                            })
-
-    except Exception as e:
-        print(f"İş Yatırım hatası: {e}")
-
-    return bulunanlar[:8]
+    return temiz[:10]
 
 
 # ─────────────────────────────────────────────
-# KAYNAK 3: Yahoo Finance — Hacim Anomalisi
+# ÇAKIŞMA
 # ─────────────────────────────────────────────
-def yahoo_hacim_anomali():
-    """Yahoo Finance üzerinden BIST hisselerinde hacim patlaması tespit eder."""
-    bulunanlar = []
 
-    # İzlenecek BIST hisseleri (spekülatif potansiyelli küçük/orta ölçekliler)
-    izleme_listesi = [
-        "SDTTR.IS", "ALTNY.IS", "KLYPV.IS", "TCKRC.IS", "ALVES.IS",
-        "BINHO.IS", "AKFYE.IS", "IZENR.IS", "GWIND.IS", "CWENE.IS",
-        "EREGL.IS", "ASELS.IS", "EKGYO.IS", "THYAO.IS", "TCELL.IS",
-        "KAPLM.IS", "KTMRK.IS", "PAPIL.IS", "MGROS.IS", "ULKER.IS",
-    ]
-
-    for sembol in izleme_listesi:
-        try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sembol}?interval=1d&range=30d"
-            r = requests.get(url, headers=HEADERS, timeout=10)
-
-            if r.status_code != 200:
-                continue
-
-            data = r.json()
-            meta = data.get("chart", {}).get("result", [{}])[0]
-            indicators = meta.get("indicators", {}).get("quote", [{}])[0]
-
-            hacimler = indicators.get("volume", [])
-            kapanis = indicators.get("close", [])
-
-            if len(hacimler) < 10:
-                continue
-
-            # Son geçerli değerleri al
-            gecerli_hacimler = [h for h in hacimler if h is not None]
-            gecerli_kapanis = [k for k in kapanis if k is not None]
-
-            if len(gecerli_hacimler) < 5:
-                continue
-
-            son_hacim = gecerli_hacimler[-1]
-            ort_hacim = sum(gecerli_hacimler[-20:-1]) / len(gecerli_hacimler[-20:-1])
-            son_fiyat = gecerli_kapanis[-1] if gecerli_kapanis else 0
-            onceki_fiyat = gecerli_kapanis[-6] if len(gecerli_kapanis) >= 6 else son_fiyat
-            fiyat_degisim = ((son_fiyat - onceki_fiyat) / onceki_fiyat * 100) if onceki_fiyat else 0
-
-            hacim_carpani = son_hacim / ort_hacim if ort_hacim > 0 else 0
-
-            # Kriter: Hacim 2x üzeri VE fiyat yatay/hafif pozitif (sessiz toplama)
-            if hacim_carpani >= 2.0 and -5 <= fiyat_degisim <= 15:
-                bist_sembol = sembol.replace(".IS", "")
-                bulunanlar.append({
-                    "sembol": bist_sembol,
-                    "hacim_carpani": round(hacim_carpani, 1),
-                    "fiyat": round(son_fiyat, 2),
-                    "fiyat_degisim": round(fiyat_degisim, 1),
-                    "kaynak": "Yahoo Finance",
-                    "tip": f"Hacim {round(hacim_carpani,1)}x — Fiyat {'+' if fiyat_degisim>=0 else ''}{round(fiyat_degisim,1)}%"
-                })
-
-        except Exception as e:
-            print(f"Yahoo {sembol} hatası: {e}")
-            continue
-
-    bulunanlar.sort(key=lambda x: x["hacim_carpani"], reverse=True)
-    return bulunanlar[:8]
-
-
-# ─────────────────────────────────────────────
-# KAYNAK 4: Yahoo Finance — Düşük Değerleme
-# ─────────────────────────────────────────────
-def yahoo_dusuk_deger():
-    """PD/DD < 1 olan BIST hisselerini tespit eder."""
-    bulunanlar = []
-
-    izleme_listesi = [
-        "EKGYO.IS", "THYAO.IS", "SAHOL.IS", "EREGL.IS", "TCELL.IS",
-        "AKBNK.IS", "GARAN.IS", "ISCTR.IS", "KCHOL.IS", "TOASO.IS",
-        "FROTO.IS", "PETKM.IS", "TUPRS.IS", "SISE.IS", "KOZAL.IS",
-    ]
-
-    for sembol in izleme_listesi:
-        try:
-            url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{sembol}?modules=defaultKeyStatistics,financialData,summaryDetail"
-            r = requests.get(url, headers=HEADERS, timeout=10)
-
-            if r.status_code != 200:
-                continue
-
-            data = r.json()
-            result = data.get("quoteSummary", {}).get("result", [{}])[0]
-
-            key_stats = result.get("defaultKeyStatistics", {})
-            summary = result.get("summaryDetail", {})
-
-            pb = key_stats.get("priceToBook", {}).get("raw", None)
-            pe = summary.get("trailingPE", {}).get("raw", None)
-            fiyat = summary.get("previousClose", {}).get("raw", 0)
-
-            if pb and pb < 1.0:
-                bist_sembol = sembol.replace(".IS", "")
-                bulunanlar.append({
-                    "sembol": bist_sembol,
-                    "pd_dd": round(pb, 2),
-                    "fk": round(pe, 1) if pe else "—",
-                    "fiyat": round(fiyat, 2),
-                    "kaynak": "Yahoo Finance",
-                    "tip": f"PD/DD: {round(pb,2)} | F/K: {round(pe,1) if pe else '—'}"
-                })
-
-        except Exception as e:
-            print(f"Yahoo değerleme {sembol} hatası: {e}")
-            continue
-
-    bulunanlar.sort(key=lambda x: x["pd_dd"])
-    return bulunanlar[:6]
-
-
-# ─────────────────────────────────────────────
-# ÇAKIŞMA — En Güçlü Sinyaller
-# ─────────────────────────────────────────────
-def guclu_sinyaller_bul(kap, takas, hacim, deger):
+def guclu_sinyaller(kap, hacim, deger):
     tum = {}
-    for kaynak in [kap, takas, hacim, deger]:
-        for item in kaynak:
+    for kaynak_list in [kap, hacim, deger]:
+        for item in kaynak_list:
             s = item["sembol"].upper().strip()
             if not s or len(s) > 8:
                 continue
@@ -264,25 +207,29 @@ def guclu_sinyaller_bul(kap, takas, hacim, deger):
                 tum[s] = {"sembol": s, "sinyaller": [], "puan": 0}
             tum[s]["sinyaller"].append(f"✅ {item['kaynak']}: {item['tip']}")
             tum[s]["puan"] += 1
-
-    guclu = [v for v in tum.values() if v["puan"] >= 2]
-    guclu.sort(key=lambda x: x["puan"], reverse=True)
-    return guclu
+    sonuc = [v for v in tum.values() if v["puan"] >= 2]
+    sonuc.sort(key=lambda x: x["puan"], reverse=True)
+    return sonuc
 
 
 # ─────────────────────────────────────────────
-# MAİL OLUŞTURUCU
+# MAİL
 # ─────────────────────────────────────────────
-def mail_olustur(kap, takas, hacim, deger, guclu):
+
+def mail_olustur(kap, hacim, deger, guclu):
     tarih = datetime.now().strftime("%d %B %Y")
 
-    def satir_olustur(items, kolonlar):
+    def tablo_satirlari(items, alanlar):
+        if not items:
+            return "<tr><td colspan='3' style='padding:12px;color:#888;text-align:center'>Bugün veri bulunamadı</td></tr>"
         html = ""
         for item in items:
-            degerler = "".join(f"<td style='padding:8px;font-size:13px;color:#444'>{item.get(k,'')}</td>" for k in kolonlar)
-            sembol = item.get("sembol", "")
-            html += f"<tr><td style='padding:8px;font-weight:bold;color:#1e40af'>{sembol}</td>{degerler}</tr>"
-        return html or "<tr><td colspan='4' style='padding:12px;color:#888;text-align:center'>Veri alınamadı</td></tr>"
+            degerler = "".join(
+                f"<td style='padding:8px;font-size:13px;color:#444'>{item.get(a, '')}</td>"
+                for a in alanlar
+            )
+            html += f"<tr><td style='padding:8px;font-weight:bold;color:#1e40af'>{item['sembol']}</td>{degerler}</tr>"
+        return html
 
     guclu_html = ""
     for h in guclu:
@@ -292,164 +239,148 @@ def mail_olustur(kap, takas, hacim, deger, guclu):
             <td style='padding:10px;font-weight:bold;font-size:15px;color:#166534'>🔥 {h['sembol']}</td>
             <td style='padding:10px;font-size:13px'>{sinyaller}</td>
             <td style='padding:10px;text-align:center'>
-                <span style='background:#16a34a;color:white;padding:3px 10px;border-radius:10px;font-weight:bold'>{h['puan']}/4</span>
+                <span style='background:#16a34a;color:white;padding:3px 10px;
+                border-radius:10px;font-weight:bold'>{h['puan']}/3</span>
             </td>
         </tr>"""
     if not guclu_html:
-        guclu_html = "<tr><td colspan='3' style='padding:15px;color:#666;text-align:center'>Bugün çakışan sinyal bulunamadı — ayrı listeler aşağıda.</td></tr>"
+        guclu_html = "<tr><td colspan='3' style='padding:15px;color:#666;text-align:center'>Bugün çakışan sinyal yok — ayrı listeler aşağıda.</td></tr>"
 
-    kap_html = satir_olustur(kap[:8], ["baslik", "tarih"])
-    hacim_html = satir_olustur(hacim[:8], ["fiyat", "tip"])
-    deger_html = satir_olustur(deger[:6], ["fiyat", "tip"])
+    kap_html    = tablo_satirlari(kap[:8],   ["baslik", "tarih"])
+    hacim_html  = tablo_satirlari(hacim[:8], ["fiyat",  "tip"])
+    deger_html  = tablo_satirlari(deger[:6], ["fiyat",  "tip"])
 
-    html = f"""<!DOCTYPE html>
+    return f"""<!DOCTYPE html>
 <html><head><meta charset='UTF-8'></head>
 <body style='font-family:Arial,sans-serif;max-width:720px;margin:0 auto;background:#f8fafc;padding:20px'>
 
-<div style='background:linear-gradient(135deg,#1e3a5f,#1d4ed8);color:white;padding:28px;border-radius:14px;margin-bottom:20px'>
-    <h1 style='margin:0;font-size:22px'>📊 BIST Günlük Tarama Raporu</h1>
-    <p style='margin:8px 0 0;opacity:.8;font-size:14px'>{tarih} • 4 Katman: KAP + Takas + Hacim + Değerleme</p>
+<div style='background:linear-gradient(135deg,#1e3a5f,#1d4ed8);color:white;
+            padding:28px;border-radius:14px;margin-bottom:20px'>
+    <h1 style='margin:0;font-size:22px'>📊 BIST Günlük Tarama — v3</h1>
+    <p style='margin:8px 0 0;opacity:.8;font-size:14px'>{tarih} &nbsp;•&nbsp; KAP + Yahoo Finance</p>
 </div>
 
 <!-- GÜÇLÜ SİNYALLER -->
 <div style='background:white;border-radius:12px;padding:20px;margin-bottom:18px;border-left:4px solid #16a34a'>
-    <h2 style='margin:0 0 6px;color:#166534;font-size:16px'>🔥 GÜÇLÜ SİNYALLER — Birden Fazla Kaynakta Çakışan</h2>
-    <p style='margin:0 0 14px;font-size:12px;color:#666'>Hem KAP haberi hem de hacim/takas anomalisi olan hisseler — en güçlü kombinasyon.</p>
+    <h2 style='margin:0 0 6px;color:#166534;font-size:16px'>🔥 GÜÇLÜ SİNYALLER</h2>
+    <p style='margin:0 0 14px;font-size:12px;color:#666'>Birden fazla kaynakta çakışan hisseler.</p>
     <table style='width:100%;border-collapse:collapse'>
         <tr style='background:#dcfce7;font-size:12px;color:#166534'>
             <th style='padding:8px;text-align:left'>Sembol</th>
             <th style='padding:8px;text-align:left'>Sinyaller</th>
             <th style='padding:8px;text-align:center'>Güç</th>
-        </tr>
-        {guclu_html}
+        </tr>{guclu_html}
     </table>
 </div>
 
 <!-- KAP -->
 <div style='background:white;border-radius:12px;padding:20px;margin-bottom:18px;border-left:4px solid #f59e0b'>
-    <h2 style='margin:0 0 6px;color:#92400e;font-size:16px'>📋 KAP — Bugünkü Özel Durum Açıklamaları</h2>
-    <p style='margin:0 0 14px;font-size:12px;color:#666'>Sözleşme, ihale, sipariş, ihracat, yatırım içeren açıklamalar.</p>
+    <h2 style='margin:0 0 6px;color:#92400e;font-size:16px'>📋 KAP — Özel Durum Açıklamaları</h2>
     <table style='width:100%;border-collapse:collapse'>
         <tr style='background:#fef3c7;font-size:12px;color:#92400e'>
             <th style='padding:8px;text-align:left;width:15%'>Sembol</th>
             <th style='padding:8px;text-align:left'>Başlık</th>
-            <th style='padding:8px;text-align:left;width:20%'>Tarih</th>
-        </tr>
-        {kap_html}
+            <th style='padding:8px;text-align:left;width:18%'>Tarih</th>
+        </tr>{kap_html}
     </table>
 </div>
 
-<!-- HACİM ANOMALİSİ -->
+<!-- HACİM -->
 <div style='background:white;border-radius:12px;padding:20px;margin-bottom:18px;border-left:4px solid #6366f1'>
-    <h2 style='margin:0 0 6px;color:#3730a3;font-size:16px'>📈 HACİM ANOMALİSİ — Sessiz Toplama Sinyali</h2>
-    <p style='margin:0 0 14px;font-size:12px;color:#666'>Ortalama hacmin 2x+ üzerinde işlem gören, fiyatı yatay seyreden hisseler.</p>
+    <h2 style='margin:0 0 6px;color:#3730a3;font-size:16px'>📈 HACİM ANOMALİSİ — Sessiz Toplama</h2>
+    <p style='margin:0 0 14px;font-size:12px;color:#666'>Ortalama hacmin 2x+ üzerinde, fiyatı sakin hisseler.</p>
     <table style='width:100%;border-collapse:collapse'>
         <tr style='background:#e0e7ff;font-size:12px;color:#3730a3'>
             <th style='padding:8px;text-align:left;width:15%'>Sembol</th>
             <th style='padding:8px;text-align:left;width:20%'>Fiyat (TL)</th>
             <th style='padding:8px;text-align:left'>Sinyal</th>
-        </tr>
-        {hacim_html}
+        </tr>{hacim_html}
     </table>
 </div>
 
-<!-- DÜŞÜK DEĞERLEME -->
+<!-- DEĞERLEME -->
 <div style='background:white;border-radius:12px;padding:20px;margin-bottom:18px;border-left:4px solid #ec4899'>
-    <h2 style='margin:0 0 6px;color:#9d174d;font-size:16px'>💎 DÜŞÜK DEĞERLEME — PD/DD &lt; 1</h2>
-    <p style='margin:0 0 14px;font-size:12px;color:#666'>Defter değerinin altında işlem gören hisseler — faiz indirimi ile canlanabilir.</p>
+    <h2 style='margin:0 0 6px;color:#9d174d;font-size:16px'>💎 DÜŞÜK DEĞERLEME — PD/DD &lt; 1.2</h2>
     <table style='width:100%;border-collapse:collapse'>
         <tr style='background:#fce7f3;font-size:12px;color:#9d174d'>
             <th style='padding:8px;text-align:left;width:15%'>Sembol</th>
             <th style='padding:8px;text-align:left;width:20%'>Fiyat (TL)</th>
             <th style='padding:8px;text-align:left'>Değerleme</th>
-        </tr>
-        {deger_html}
+        </tr>{deger_html}
     </table>
 </div>
 
-<!-- KONTROL LİSTESİ -->
+<!-- KONTROL -->
 <div style='background:white;border-radius:12px;padding:20px;margin-bottom:18px'>
     <h2 style='margin:0 0 12px;color:#374151;font-size:16px'>✅ Bugün Yapman Gerekenler</h2>
     <ol style='margin:0;padding-left:20px;line-height:2.2;color:#4b5563;font-size:14px'>
-        <li>Güçlü sinyal listesini <b>TradingView</b>'de aç, grafiğe bak</li>
-        <li>Hacim anomalisindeki hisselerde <b>Fintables → takas geçmişi</b> kontrol et</li>
+        <li>Güçlü sinyal listesini <b>TradingView</b>'de aç</li>
+        <li>Hacim anomalisinde <b>Fintables → takas geçmişi</b> kontrol et</li>
         <li>KAP açıklamalarının tam metnini oku (<b>kap.org.tr</b>)</li>
         <li>Piyasa değeri <b>2 milyar TL altında</b> mı doğrula</li>
-        <li>Giriş düşündüğün hissede <b>kademeli pozisyon</b> al (%10 kural)</li>
+        <li>Giriş düşündüğünde <b>kademeli pozisyon</b> al (%10 kural)</li>
     </ol>
 </div>
 
 <div style='background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:14px;margin-bottom:10px'>
-    <p style='margin:0;font-size:12px;color:#991b1b'>⚠️ <b>Yatırım tavsiyesi değildir.</b> Otomatik veri taramasıdır. Spekülatif hisseler yüksek risk içerir.</p>
+    <p style='margin:0;font-size:12px;color:#991b1b'>
+    ⚠️ <b>Yatırım tavsiyesi değildir.</b> Otomatik veri taramasıdır. Spekülatif hisseler yüksek risk içerir.
+    </p>
 </div>
-
-<p style='text-align:center;color:#9ca3af;font-size:11px;margin:0'>
-    BIST Tarama v2 • Yahoo Finance + KAP RSS • {tarih}
-</p>
-
+<p style='text-align:center;color:#9ca3af;font-size:11px'>BIST Tarama v3 • {tarih}</p>
 </body></html>"""
-    return html
 
 
-# ─────────────────────────────────────────────
-# MAİL GÖNDER
-# ─────────────────────────────────────────────
 def mail_gonder(html):
     if not all([GMAIL_USER, GMAIL_PASS, HEDEF_MAIL]):
         print("❌ Mail bilgileri eksik.")
-        return False
+        return
     try:
         msg = MIMEMultipart("alternative")
-        tarih_kisa = datetime.now().strftime("%d.%m.%Y")
-        msg["Subject"] = f"📊 BIST Tarama — {tarih_kisa}"
-        msg["From"] = GMAIL_USER
-        msg["To"] = HEDEF_MAIL
+        msg["Subject"] = f"📊 BIST Tarama — {datetime.now().strftime('%d.%m.%Y')}"
+        msg["From"]    = GMAIL_USER
+        msg["To"]      = HEDEF_MAIL
         msg.attach(MIMEText(html, "html", "utf-8"))
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
             s.login(GMAIL_USER, GMAIL_PASS)
             s.sendmail(GMAIL_USER, HEDEF_MAIL, msg.as_string())
         print(f"✅ Mail gönderildi → {HEDEF_MAIL}")
-        return True
     except Exception as e:
         print(f"❌ Mail hatası: {e}")
-        return False
 
 
 # ─────────────────────────────────────────────
 # ANA AKIŞ
 # ─────────────────────────────────────────────
+
 def main():
-    print(f"🔍 BIST Tarama v2 başlıyor — {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+    print(f"🔍 BIST Tarama v3 — {datetime.now().strftime('%d.%m.%Y %H:%M')}")
 
-    print("  → KAP RSS açıklamaları...")
+    print("  → KAP RSS...")
     kap = kap_rss_tara()
-    print(f"     {len(kap)} açıklama")
+    print(f"     {len(kap)} açıklama bulundu")
 
-    print("  → İş Yatırım takas...")
-    takas = isyatirim_takas_tara()
-    print(f"     {len(takas)} hisse")
-
-    print("  → Yahoo Finance hacim anomalisi...")
-    hacim = yahoo_hacim_anomali()
-    print(f"     {len(hacim)} hisse")
-
-    print("  → Yahoo Finance değerleme...")
-    deger = yahoo_dusuk_deger()
-    print(f"     {len(deger)} hisse")
+    print("  → Yahoo Finance tarama...")
+    hacim, deger = yahoo_tarama()
+    print(f"     Hacim anomalisi: {len(hacim)} | Düşük değerleme: {len(deger)}")
 
     print("  → Güçlü sinyaller...")
-    guclu = guclu_sinyaller_bul(kap, takas, hacim, deger)
+    guclu = guclu_sinyaller(kap, hacim, deger)
     print(f"     {len(guclu)} çakışan sinyal")
 
-    if guclu:
-        print("\n  🔥 Bugünün güçlü sinyalleri:")
-        for h in guclu:
-            print(f"     {h['sembol']} — {h['puan']}/4 puan")
+    if hacim:
+        print("\n  📈 Hacim anomalisi bulunanlar:")
+        for h in hacim:
+            print(f"     {h['sembol']} — {h['tip']}")
 
-    print("\n  → Mail gönderiliyor...")
-    html = mail_olustur(kap, takas, hacim, deger, guclu)
+    if deger:
+        print("\n  💎 Düşük değerleme bulunanlar:")
+        for d in deger:
+            print(f"     {d['sembol']} — {d['tip']}")
+
+    html = mail_olustur(kap, hacim, deger, guclu)
     mail_gonder(html)
-    print("✅ Tamamlandı.")
+    print("\n✅ Tamamlandı.")
 
 
 if __name__ == "__main__":
