@@ -48,4 +48,220 @@ def yahoo_tarama():
             if len(hacimler) < 5:
                 continue
             basarili += 1
-            fiyat     = meta.get("regularMarketP
+            fiyat     = meta.get("regularMarketPrice", 0) or 0
+            son_hacim = hacimler[-1]
+            ort_hacim = sum(hacimler[-20:-1]) / max(len(hacimler[-20:-1]), 1)
+            carpan    = son_hacim / ort_hacim if ort_hacim else 0
+            degisim   = 0
+            if len(kapanis) >= 6 and kapanis[-6]:
+                degisim = (kapanis[-1] - kapanis[-6]) / kapanis[-6] * 100
+            bist = sembol.replace(".IS","")
+            if carpan >= 1.5 and -8 <= degisim <= 20:
+                hacim_anomali.append({
+                    "sembol": bist, "fiyat": round(fiyat,2),
+                    "tip": f"Hacim {round(carpan,1)}x | Fiyat {'+' if degisim>=0 else ''}{round(degisim,1)}%",
+                    "carpan": round(carpan,1), "kaynak": "Yahoo Finance",
+                })
+            pb = meta.get("priceToBook")
+            pe = meta.get("trailingPE")
+            if pb and 0 < pb < 2.0:
+                dusuk_deger.append({
+                    "sembol": bist, "fiyat": round(fiyat,2),
+                    "tip": f"PD/DD: {round(pb,2)} | F/K: {round(pe,1) if pe else '—'}",
+                    "pd_dd": round(pb,2), "kaynak": "Yahoo Finance",
+                })
+        except Exception as e:
+            print(f"    {sembol} hata: {e}")
+        if i % 5 == 4:
+            time.sleep(0.3)
+    print(f"     {basarili} hisse çekildi | Hacim: {len(hacim_anomali)} | Değerleme: {len(dusuk_deger)}")
+    hacim_anomali.sort(key=lambda x: x["carpan"], reverse=True)
+    dusuk_deger.sort(key=lambda x: x["pd_dd"])
+    return hacim_anomali[:8], dusuk_deger[:6]
+
+def kap_tara():
+    bulunanlar = []
+    anahtar = ["sözleşme","ihale","ihracat","sipariş","ortaklık","yatırım","proje","anlaşma","kazandı"]
+    urls = [
+        "https://bigpara.hurriyet.com.tr/haberler/kap-haberleri/",
+        "https://www.bloomberght.com/haberler",
+    ]
+    for url in urls:
+        try:
+            r = SESSION.get(url, timeout=15)
+            print(f"     Haber {url}: {r.status_code}")
+            if r.status_code != 200:
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            for tag in soup.find_all(["h2","h3","a","li"], limit=80):
+                metin = tag.get_text(strip=True)
+                if len(metin) < 10:
+                    continue
+                for kelime in anahtar:
+                    if kelime in metin.lower():
+                        semboller = re.findall(r'\b[A-Z]{3,6}\b', metin)
+                        sembol = semboller[0] if semboller else "HABER"
+                        bulunanlar.append({
+                            "sembol": sembol,
+                            "baslik": metin[:100],
+                            "tarih": datetime.now().strftime("%d.%m.%Y"),
+                            "kaynak": "Haberler", "tip": f"'{kelime}'",
+                        })
+                        break
+            if bulunanlar:
+                break
+        except Exception as e:
+            print(f"     Haber hata: {e}")
+    gorulen, temiz = set(), []
+    for item in bulunanlar:
+        if item["sembol"] not in gorulen and item["sembol"] != "HABER":
+            gorulen.add(item["sembol"])
+            temiz.append(item)
+    print(f"     {len(temiz)} haber bulundu")
+    return temiz[:10]
+
+def guclu_sinyaller(kap, hacim, deger):
+    tum = {}
+    for lst in [kap, hacim, deger]:
+        for item in lst:
+            s = item["sembol"].upper().strip()
+            if not s or len(s) > 7:
+                continue
+            if s not in tum:
+                tum[s] = {"sembol": s, "sinyaller": [], "puan": 0}
+            tum[s]["sinyaller"].append(f"✅ {item['kaynak']}: {item['tip']}")
+            tum[s]["puan"] += 1
+    sonuc = sorted(tum.values(), key=lambda x: x["puan"], reverse=True)
+    return sonuc[:12]
+
+def mail_olustur(kap, hacim, deger, guclu):
+    tarih = datetime.now().strftime("%d %B %Y")
+
+    def satirlar(items, alanlar):
+        if not items:
+            return "<tr><td colspan='3' style='padding:12px;color:#888;text-align:center'>Bugün veri bulunamadı</td></tr>"
+        html = ""
+        for item in items:
+            degerler = "".join(f"<td style='padding:8px;font-size:13px;color:#444'>{item.get(a,'')}</td>" for a in alanlar)
+            html += f"<tr><td style='padding:8px;font-weight:bold;color:#1e40af'>{item['sembol']}</td>{degerler}</tr>"
+        return html
+
+    guclu_html = ""
+    for h in guclu:
+        puan_renk = "#16a34a" if h["puan"] >= 2 else "#ca8a04"
+        sinyaller = "<br>".join(h["sinyaller"])
+        guclu_html += f"""
+        <tr style='background:#f0fdf4'>
+            <td style='padding:10px;font-weight:bold;font-size:15px;color:#166534'>
+                {"🔥" if h["puan"]>=2 else "📌"} {h['sembol']}
+            </td>
+            <td style='padding:10px;font-size:13px'>{sinyaller}</td>
+            <td style='padding:10px;text-align:center'>
+                <span style='background:{puan_renk};color:white;padding:3px 10px;
+                border-radius:10px;font-weight:bold'>{h["puan"]}/3</span>
+            </td>
+        </tr>"""
+    if not guclu_html:
+        guclu_html = "<tr><td colspan='3' style='padding:15px;color:#666;text-align:center'>Bugün sinyal bulunamadı</td></tr>"
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset='UTF-8'></head>
+<body style='font-family:Arial,sans-serif;max-width:720px;margin:0 auto;background:#f8fafc;padding:20px'>
+<div style='background:linear-gradient(135deg,#1e3a5f,#1d4ed8);color:white;padding:28px;border-radius:14px;margin-bottom:20px'>
+    <h1 style='margin:0;font-size:22px'>📊 BIST Günlük Tarama</h1>
+    <p style='margin:8px 0 0;opacity:.8;font-size:14px'>{tarih} • Yahoo Finance + KAP Haberleri</p>
+</div>
+<div style='background:white;border-radius:12px;padding:20px;margin-bottom:18px;border-left:4px solid #16a34a'>
+    <h2 style='margin:0 0 6px;color:#166534;font-size:16px'>🔥 TÜM SİNYALLER</h2>
+    <p style='margin:0 0 14px;font-size:12px;color:#666'>🔥 = Birden fazla kaynakta çakışan &nbsp;|&nbsp; 📌 = Tek kaynaktan gelen</p>
+    <table style='width:100%;border-collapse:collapse'>
+        <tr style='background:#dcfce7;font-size:12px;color:#166534'>
+            <th style='padding:8px;text-align:left'>Sembol</th>
+            <th style='padding:8px;text-align:left'>Sinyaller</th>
+            <th style='padding:8px;text-align:center'>Güç</th>
+        </tr>{guclu_html}
+    </table>
+</div>
+<div style='background:white;border-radius:12px;padding:20px;margin-bottom:18px;border-left:4px solid #6366f1'>
+    <h2 style='margin:0 0 6px;color:#3730a3;font-size:16px'>📈 HACİM ANOMALİSİ — Sessiz Toplama</h2>
+    <table style='width:100%;border-collapse:collapse'>
+        <tr style='background:#e0e7ff;font-size:12px;color:#3730a3'>
+            <th style='padding:8px;text-align:left;width:15%'>Sembol</th>
+            <th style='padding:8px;text-align:left;width:20%'>Fiyat (TL)</th>
+            <th style='padding:8px;text-align:left'>Sinyal</th>
+        </tr>{satirlar(hacim, ["fiyat","tip"])}
+    </table>
+</div>
+<div style='background:white;border-radius:12px;padding:20px;margin-bottom:18px;border-left:4px solid #ec4899'>
+    <h2 style='margin:0 0 6px;color:#9d174d;font-size:16px'>💎 DÜŞÜK DEĞERLEME — PD/DD &lt; 2</h2>
+    <table style='width:100%;border-collapse:collapse'>
+        <tr style='background:#fce7f3;font-size:12px;color:#9d174d'>
+            <th style='padding:8px;text-align:left;width:15%'>Sembol</th>
+            <th style='padding:8px;text-align:left;width:20%'>Fiyat (TL)</th>
+            <th style='padding:8px;text-align:left'>Değerleme</th>
+        </tr>{satirlar(deger, ["fiyat","tip"])}
+    </table>
+</div>
+<div style='background:white;border-radius:12px;padding:20px;margin-bottom:18px;border-left:4px solid #f59e0b'>
+    <h2 style='margin:0 0 6px;color:#92400e;font-size:16px'>📋 KAP HABERLERİ</h2>
+    <table style='width:100%;border-collapse:collapse'>
+        <tr style='background:#fef3c7;font-size:12px;color:#92400e'>
+            <th style='padding:8px;text-align:left;width:15%'>Sembol</th>
+            <th style='padding:8px;text-align:left'>Başlık</th>
+            <th style='padding:8px;text-align:left;width:18%'>Tarih</th>
+        </tr>{satirlar(kap, ["baslik","tarih"])}
+    </table>
+</div>
+<div style='background:white;border-radius:12px;padding:20px;margin-bottom:18px'>
+    <h2 style='margin:0 0 12px;color:#374151;font-size:16px'>✅ Bugün Yapman Gerekenler</h2>
+    <ol style='margin:0;padding-left:20px;line-height:2.2;color:#4b5563;font-size:14px'>
+        <li>Sinyal listesindeki hisseleri <b>TradingView</b>'de aç</li>
+        <li>Hacim anomalisinde <b>Fintables → takas geçmişi</b> kontrol et</li>
+        <li>Giriş düşündüğünde <b>kademeli pozisyon</b> al (%10 kural)</li>
+    </ol>
+</div>
+<div style='background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:14px'>
+    <p style='margin:0;font-size:12px;color:#991b1b'>⚠️ <b>Yatırım tavsiyesi değildir.</b> Otomatik veri taramasıdır.</p>
+</div>
+</body></html>"""
+
+def mail_gonder(html):
+    if not all([GMAIL_USER, GMAIL_PASS, HEDEF_MAIL]):
+        print("❌ Mail bilgileri eksik.")
+        return
+    try:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"📊 BIST Tarama — {datetime.now().strftime('%d.%m.%Y')}"
+        msg["From"] = GMAIL_USER
+        msg["To"]   = HEDEF_MAIL
+        msg.attach(MIMEText(html, "html", "utf-8"))
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(GMAIL_USER, GMAIL_PASS)
+            s.sendmail(GMAIL_USER, HEDEF_MAIL, msg.as_string())
+        print(f"✅ Mail gönderildi → {HEDEF_MAIL}")
+    except Exception as e:
+        print(f"❌ Mail hatası: {e}")
+
+def main():
+    print(f"🔍 BIST Tarama v3.1 — {datetime.now().strftime('%d.%m.%Y %H:%M')}")
+    print("  → Yahoo Finance tarama...")
+    hacim, deger = yahoo_tarama()
+    print("  → KAP/Haber tarama...")
+    kap = kap_tara()
+    print("  → Sinyaller hesaplanıyor...")
+    guclu = guclu_sinyaller(kap, hacim, deger)
+    print(f"     {len(guclu)} sinyal")
+    if hacim:
+        print("\n  📈 Hacim anomalisi:")
+        for h in hacim:
+            print(f"     {h['sembol']} — {h['tip']}")
+    if deger:
+        print("\n  💎 Düşük değerleme:")
+        for d in deger:
+            print(f"     {d['sembol']} — {d['tip']}")
+    html = mail_olustur(kap, hacim, deger, guclu)
+    mail_gonder(html)
+    print("\n✅ Tamamlandı.")
+
+if __name__ == "__main__":
+    main()
